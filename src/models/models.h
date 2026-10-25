@@ -2683,29 +2683,38 @@ struct llama_model_qwen4exp : public llama_model_base {
                             int * sections,
                             int   il);
 
-        // dense self-attention over the cells the QSA mask keeps
+        // QSA keeps a dense mask over the cache, or for decode the gathered cells' index and bias
+        struct qsa_sel {
+            ggml_tensor * mask = nullptr; // F16 [n_kv, n_tokens], the cells the query may see, -inf elsewhere
+            ggml_tensor * idx  = nullptr; // I32 [n_pad, n_tokens], the selected cells, padded to a multiple of 256
+            ggml_tensor * bias = nullptr; // F32 [n_pad, 1, 1, n_tokens], -inf for the dead slots and the padding
+        };
+
+        // dense self-attention over the cells the QSA selection keeps, masked or gathered
         ggml_tensor * build_attn_qsa(
         llm_graph_input_attn_kv * inp,
                     ggml_tensor * q_cur,
                     ggml_tensor * k_cur,
                     ggml_tensor * v_cur,
-                    ggml_tensor * sel,
+                        qsa_sel   sel,
                         int64_t   n_sel,
                           float   kq_scale,
-                            int   il);
+                            int   il,
+                           bool   gather);
 
         // the QSA layers share one set of k-pool inputs, see llama_memory_hybrid_idx
         llm_graph_input_kpool * build_inp_kpool(const llama_memory_hybrid_idx_context * mctx_hyb);
 
-        // QSA: the additive mask [n_kv, n_tokens] of the top blocks and the tail, kq_mask included
-        ggml_tensor * build_qsa_sel(
+        // QSA: the cells of the top blocks and the tail, as a dense mask or as a gathered index and bias
+        qsa_sel build_qsa_sel(
   const llama_memory_hybrid_idx_context * mctx_hyb,
           llm_graph_input_kpool * inp_kpool,
                     ggml_tensor * cur,
                     ggml_tensor * inp_pos,
                     ggml_tensor * kq_mask,
                             int * sections,
-                            int   il);
+                            int   il,
+                           bool   gather);
 
         ggml_tensor * build_layer_attn_linear(
              llm_graph_input_rs * inp,
