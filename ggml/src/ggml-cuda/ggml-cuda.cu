@@ -1445,6 +1445,7 @@ struct batched_mul_mat_traits<GGML_TYPE_F32> {
     static inline const void* get_beta() { static const float val = beta; return &val; }
     static inline auto convert(ggml_type src_type) { return ggml_get_to_fp32_cuda(src_type); }
     static inline auto convert_nc(ggml_type src_type) { return ggml_get_to_fp32_nc_cuda(src_type); }
+    static inline to_t_ld_cuda_t<float> convert_ld(ggml_type) { return nullptr; }
 };
 
 template<>
@@ -1459,6 +1460,7 @@ struct batched_mul_mat_traits<GGML_TYPE_BF16> {
     static inline const void* get_beta() { static const float val = beta; return &val; }
     static inline auto convert(ggml_type src_type) { return ggml_get_to_bf16_cuda(src_type); }
     static inline auto convert_nc(ggml_type src_type) { return ggml_get_to_bf16_nc_cuda(src_type); }
+    static inline to_t_ld_cuda_t<nv_bfloat16> convert_ld(ggml_type) { return nullptr; }
 };
 
 template<>
@@ -1473,6 +1475,7 @@ struct batched_mul_mat_traits<GGML_TYPE_F16> {
     static inline const void* get_beta() { static const half val = beta; return &val; }
     static inline auto convert(ggml_type src_type) { return ggml_get_to_fp16_cuda(src_type); }
     static inline auto convert_nc(ggml_type src_type) { return ggml_get_to_fp16_nc_cuda(src_type); }
+    static inline auto convert_ld(ggml_type src_type) { return ggml_get_to_fp16_ld_cuda(src_type); }
 };
 
 template<ggml_type compute_type>
@@ -1514,8 +1517,21 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     bool is_src0_cont_2 = ggml_is_contiguous_2(src0);
     bool is_src1_cont_2 = ggml_is_contiguous_2(src1);
 
+    // gfx1151: F16 rows 4 KB apart land on the same memory channels, 64 extra values per row cut a
+    // [6144 -> 2560] Q6_K x 4096 GEMM from 4.58 to 2.94 ms. Single-matrix only: the padded branch does not rewrite s02/s03.
+    static const bool ld_pad_off = getenv("GGML_CUDA_DISABLE_CUBLAS_PAD") != nullptr;
+    const int64_t ld_pad = !ld_pad_off && GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[ctx.device].cc) &&
+        ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 && (ne00*sizeof(cuda_t)) % 4096 == 0 ? ne00 + 64 : 0;
+    const auto src0_ld = ld_pad > 0 && ggml_is_contiguous(src0) ? traits::convert_ld(src0->type) : nullptr;
+    const auto src1_ld = src0_ld != nullptr && ggml_is_contiguous(src1) ? traits::convert_ld(src1->type) : nullptr;
+
     if (src0->type == compute_type) {
         src0_ptr = (const cuda_t *) src0->data;
+    } else if (src0_ld != nullptr) {
+        src0_alloc.alloc(ld_pad*ne01);
+        src0_ld(src0->data, src0_alloc.get(), ne00, ne01, ld_pad, main_stream);
+        s01 = ld_pad;
+        src0_ptr = src0_alloc.get();
     } else {
         src0_alloc.alloc(ggml_nelements(src0));
 
@@ -1541,6 +1557,12 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
 
     if (src1->type == compute_type) {
         src1_ptr = (const cuda_t *) src1->data;
+    } else if (src1_ld != nullptr) {
+        GGML_ASSERT(ne10 == ne00); // one padding width for both operands
+        src1_alloc.alloc(ld_pad*ne11);
+        src1_ld(src1->data, src1_alloc.get(), ne10, ne11, ld_pad, main_stream);
+        s11 = ld_pad;
+        src1_ptr = src1_alloc.get();
     } else {
         src1_alloc.alloc(ggml_nelements(src1));
 
